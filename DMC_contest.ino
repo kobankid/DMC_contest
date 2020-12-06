@@ -8,13 +8,21 @@
 
 ////////ハードウェアパラメータ/////////
 //OLED 関係
-#include<Wire.h>
+#include <Wire.h>
 #include <Adafruit_SSD1306.h>
+#include <MsTimer2.h>
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 32 // OLED display height, in pixels
 // Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
 #define OLED_RESET     4 // Reset pin # (or -1 if sharing Arduino reset pin)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// function declaration
+void timer_interrupt(void);
+void parameter_display(void);
+void goal_lap_check(void);
+void time_check(void);
+void disp_lap_time(void);
 
 // ピン設定
 //LED
@@ -44,6 +52,14 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 //↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
 
 ////////ソフトウェアパラメータ/////////
+//#define DEBUG
+
+#ifdef DEBUG
+#define GET_CYCLE(a) time_history[a++] = microns()
+#else
+#define GET_CYCLE(a)
+#endif
+
 
 // 定数設定---------------------------------------------
 #define SW_OFF  HIGH
@@ -52,6 +68,8 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define MT_REVERSE_L  LOW
 #define MT_FORWARD_R  LOW
 #define MT_REVERSE_R  HIGH
+
+#define TIME_HISTORY_NUM 10
 //---------------------------------------------------
 
 //パラメータ設定---------------------------------------
@@ -76,6 +94,9 @@ unsigned long total_time;
 unsigned long lap_time[LAP_NUM+1];
 unsigned long boot_time;
 byte n_lap = 0;
+
+unsigned long time_history[TIME_HISTORY_NUM];
+
 //-----------------------------
 
 //↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集OK↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
@@ -91,12 +112,12 @@ void setup() {
   pinMode(LED,OUTPUT);
   pinMode(SW_R,INPUT_PULLUP);
   pinMode(SW_L,INPUT_PULLUP);
-  
+
   //シリアル通信を開始
   Serial.begin(9600);
-  
+
   //OLED初期化
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) 
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
   { // Address 0x3C for 128x32
   Serial.println(F("SSD1306 allocation failed"));
   for (;;); // Don't proceed, loop forever
@@ -107,22 +128,24 @@ void setup() {
 
   //↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集NG↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
-  //↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓  
+  //↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
 
-  
+
   //モータの回転方向を設定
   digitalWrite(MT_DIR_L,MT_FORWARD_L);//前進
   digitalWrite(MT_DIR_R,MT_FORWARD_R);//前進
-  
+
   //機種名表示-----------------------
   display.clearDisplay();
-  display.setTextSize(2); 
+  display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
   display.print(F("DMC TRACER"));
   display.display();
   delay(2000);
- //--------------------------------
+  //--------------------------------
 
+  MsTimer2::set(100, timer_interrupt);
+  MsTimer2::start();
 
   //右スイッチがONになるまでループ
   while(1)
@@ -151,16 +174,7 @@ void setup() {
   //↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集OK↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 }
 
-
-
-//メインループ
-void loop() {
-  
-  // put your main code here, to run repeatedly:
-  //繰り返し走るプログラム
-
-  //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
-    
+void timer_interrupt(void) {
   //ラインセンサを読み込む
   line_sensor_l1 = analogRead(LS_L1);
   line_sensor_r1 = analogRead(LS_R1);
@@ -192,21 +206,83 @@ void loop() {
     {
       //左折
       analogWrite(MT_PWM_R,vel_set_r);
-      analogWrite(MT_PWM_L,0); 
+      analogWrite(MT_PWM_L,0);
     }
     else//かつ右外側のセンサがラインを認識しているとき(黒と認識しているとき)
     {
       //直進
       analogWrite(MT_PWM_R,vel_set_r);
       analogWrite(MT_PWM_L,vel_set_l);
-    } 
-  } 
+    }
+  }
+}
+
+//メインループ
+void loop() {
+
+  // put your main code here, to run repeatedly:
+  //繰り返し走るプログラム
+
+  //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
+
+  unsigned long i_time = 0;
+  unsigned long elapse_time;
+
+  GET_CYCLE(i_time);
+
+#if 0
+  //ラインセンサを読み込む
+  line_sensor_l1 = analogRead(LS_L1);
+  line_sensor_r1 = analogRead(LS_R1);
+  line_sensor_l2 = analogRead(LS_L2);
+  line_sensor_r2 = analogRead(LS_R2);
+
+  GET_CYCLE(i_time);
+
+  //センサ値に応じた走行パターンを決定----------------------------------
+  //左外側のセンサがラインを認識していないとき(白と認識しているとき)
+  if(line_sensor_l2 > THREAD_LINE)
+  {
+     //かつ右外側のセンサがラインを認識していないとき(白と認識しているとき)
+    if(line_sensor_r2 > THREAD_LINE)
+    {
+      //直進
+      analogWrite(MT_PWM_R,vel_set_r);
+      analogWrite(MT_PWM_L,vel_set_l);
+    }
+    else//かつ右外側のセンサがラインを認識しているとき(黒と認識しているとき)
+    {
+      //右折
+      analogWrite(MT_PWM_R,0);
+      analogWrite(MT_PWM_L,vel_set_l);
+    }
+  }
+  else//左外側のセンサがラインを認識しているとき(黒と認識しているとき)
+  {
+    //かつ右外側のセンサがラインを認識していないとき（白と認識しているとき）
+    if(line_sensor_r2 > THREAD_LINE)
+    {
+      //左折
+      analogWrite(MT_PWM_R,vel_set_r);
+      analogWrite(MT_PWM_L,0);
+    }
+    else//かつ右外側のセンサがラインを認識しているとき(黒と認識しているとき)
+    {
+      //直進
+      analogWrite(MT_PWM_R,vel_set_r);
+      analogWrite(MT_PWM_L,vel_set_l);
+    }
+  }
+
+  GET_CYCLE(i_time);
+
+#endif
   //----------------------------------------------------------------------
 
 
   //↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集OK↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
-  
+
   //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集NG↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
   boot_time = millis();
   goal_lap_check();//編集禁止
@@ -222,7 +298,23 @@ void loop() {
     }
   }
   //↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集NG↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
- 
+
+#if 0
+  GET_CYCLE(i_time);
+
+  for (int i = 0; i < i_time; i++) {
+    if (i > 0) {
+      elapse_time = time_history[i] - time_history[i-1];
+      Serial.print("elapse_time[");
+      Serial.print(i);
+      Serial.print("]=");
+      Serial.print(elapse_time);
+      Serial.println("[us]");
+      delayMicroseconds(10000);
+    }
+  }
+  i_time = 0;
+#endif
 }
 
 
@@ -248,7 +340,7 @@ void parameter_display(void){
     display.print(F(", R2:"));
     display.print(line_sensor_r2);
     display.display();
-    delay(10);
+    delay(5);
 }
 
 
@@ -277,9 +369,9 @@ void time_check(void)
 void goal_lap_check(void){
 
   bool flg_sgline;
-  bool static flg_sgline_prev = 0; 
+  bool static flg_sgline_prev = 0;
   byte static disp_count;
-  
+
   //ゴールラインのチェック処理----------------------------------------
   bool t_ls11 = (line_sensor_l1 < THREAD_LINE);
   bool t_lsr1 = (line_sensor_r1 < THREAD_LINE);
@@ -288,10 +380,10 @@ void goal_lap_check(void){
 
   flg_sgline = 0;
   //すべてのセンサでラインを検出したとき、ゴールラインの検出とする。
-  if ((t_ls11 == 1) && (t_lsr1 == 1) && (t_lsl2 == 1) && (t_lsr2 == 1)) 
+  if ((t_ls11 == 1) && (t_lsr1 == 1) && (t_lsl2 == 1) && (t_lsr2 == 1))
   {
     flg_sgline = 1;
-  } 
+  }
   bool t_line = LOW;
   //ゴールラインを検出　かつ　前回ゴールラインを検出していないとき
   //ゴールライン検出フラグをたて、ラップ数をインクリメント、ラップタイムを記録する。
@@ -317,7 +409,7 @@ void disp_lap_time(void)
 {
   display.clearDisplay();
 
-  display.setTextSize(2); 
+  display.setTextSize(2);
   display.setCursor(0, 0);
   display.print(F("T:"));
 
@@ -325,7 +417,7 @@ void disp_lap_time(void)
 
   display.print(tt,2);
 
-  display.setTextSize(2); 
+  display.setTextSize(2);
   display.setCursor(0, 16);
   display.print(F("L:"));
 
