@@ -52,13 +52,23 @@ void disp_lap_time(void);
 //↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
 
 ////////ソフトウェアパラメータ/////////
-//#define DEBUG
+// #define DEBUG
 
 #ifdef DEBUG
-#define GET_CYCLE(a) time_history[a++] = microns()
+#define GET_CYCLE(a)                \
+    do {                            \
+        time_history[a] = micros(); \
+        if (a < TIME_HISTORY_NUM) { \
+            a++;                    \
+        } else {                    \
+            a = 0;                  \
+        }                           \
+    } while(0)
 #else
 #define GET_CYCLE(a)
 #endif
+
+#define ABS(a) (a>=0 ? a : -a)
 
 
 // 定数設定---------------------------------------------
@@ -69,7 +79,18 @@ void disp_lap_time(void);
 #define MT_FORWARD_R  LOW
 #define MT_REVERSE_R  HIGH
 
+/* Log parameter */
 #define TIME_HISTORY_NUM 10
+
+/* Control parameter */
+#define CTRL_INTERVAL (100)
+#define INNER_COEF    (1)
+#define OUTER_COEF    (2)
+#define OFFSET        (0)
+#define MAX_ERR       (500 * (INNER_COEF + OUTER_COEF))
+#define DEAD_ZONE_TH  (100)
+#define COEF          (65536 / MAX_ERR)
+
 //---------------------------------------------------
 
 //パラメータ設定---------------------------------------
@@ -88,6 +109,7 @@ long  vr_ad_r;
 
 long  vel_set_l;
 long  vel_set_r;
+long  g_coef;
 
 unsigned long start_time;
 unsigned long total_time;
@@ -96,6 +118,11 @@ unsigned long boot_time;
 byte n_lap = 0;
 
 unsigned long time_history[TIME_HISTORY_NUM];
+unsigned long i_time = 0;
+unsigned long elapse_time;
+volatile unsigned int interrupt_flag = 0;
+
+
 
 //-----------------------------
 
@@ -131,6 +158,8 @@ void setup() {
   //↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
 
 
+  g_coef = COEF;
+
   //モータの回転方向を設定
   digitalWrite(MT_DIR_L,MT_FORWARD_L);//前進
   digitalWrite(MT_DIR_R,MT_FORWARD_R);//前進
@@ -144,8 +173,7 @@ void setup() {
   delay(2000);
   //--------------------------------
 
-  MsTimer2::set(100, timer_interrupt);
-  MsTimer2::start();
+  i_time = 0;
 
   //右スイッチがONになるまでループ
   while(1)
@@ -171,50 +199,15 @@ void setup() {
     //OLEDに各パラメータ値出力(デバッグ用)
     parameter_display();
   }
+
+  /* MsTimer2::set(CTRL_INTERVAL, timer_interrupt); */
+  /* MsTimer2::start(); */
   //↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集OK↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 }
 
 void timer_interrupt(void) {
-  //ラインセンサを読み込む
-  line_sensor_l1 = analogRead(LS_L1);
-  line_sensor_r1 = analogRead(LS_R1);
-  line_sensor_l2 = analogRead(LS_L2);
-  line_sensor_r2 = analogRead(LS_R2);
-
-  //センサ値に応じた走行パターンを決定----------------------------------
-  //左外側のセンサがラインを認識していないとき(白と認識しているとき)
-  if(line_sensor_l2 > THREAD_LINE)
-  {
-     //かつ右外側のセンサがラインを認識していないとき(白と認識しているとき)
-    if(line_sensor_r2 > THREAD_LINE)
-    {
-      //直進
-      analogWrite(MT_PWM_R,vel_set_r);
-      analogWrite(MT_PWM_L,vel_set_l);
-    }
-    else//かつ右外側のセンサがラインを認識しているとき(黒と認識しているとき)
-    {
-      //右折
-      analogWrite(MT_PWM_R,0);
-      analogWrite(MT_PWM_L,vel_set_l);
-    }
-  }
-  else//左外側のセンサがラインを認識しているとき(黒と認識しているとき)
-  {
-    //かつ右外側のセンサがラインを認識していないとき（白と認識しているとき）
-    if(line_sensor_r2 > THREAD_LINE)
-    {
-      //左折
-      analogWrite(MT_PWM_R,vel_set_r);
-      analogWrite(MT_PWM_L,0);
-    }
-    else//かつ右外側のセンサがラインを認識しているとき(黒と認識しているとき)
-    {
-      //直進
-      analogWrite(MT_PWM_R,vel_set_r);
-      analogWrite(MT_PWM_L,vel_set_l);
-    }
-  }
+  interrupt_flag = 1;
+  //Serial.println("interrupts");
 }
 
 //メインループ
@@ -223,22 +216,72 @@ void loop() {
   // put your main code here, to run repeatedly:
   //繰り返し走るプログラム
 
+  long err = 0;
+  int sign = 1;
+
+  g_coef = COEF;
+  /* Serial.print("g_coef = "); */
+  /* Serial.println(g_coef); */
+
   //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
-
-  unsigned long i_time = 0;
-  unsigned long elapse_time;
-
+  /* while (interrupt_flag == 0) { */
+  /*     /\* wait for interrupt *\/ */
+  /* } */
+  //noInterrupts();
   GET_CYCLE(i_time);
-
-#if 0
+  interrupt_flag = 0;
   //ラインセンサを読み込む
   line_sensor_l1 = analogRead(LS_L1);
   line_sensor_r1 = analogRead(LS_R1);
   line_sensor_l2 = analogRead(LS_L2);
   line_sensor_r2 = analogRead(LS_R2);
 
-  GET_CYCLE(i_time);
+  err = (INNER_COEF * (line_sensor_l1 - line_sensor_r1))
+      + (OUTER_COEF * (line_sensor_l2 - line_sensor_r2))
+      + OFFSET;
 
+  vel_set_l = vr_ad_l * 255 / 1023;
+  vel_set_r = vr_ad_r * 255 / 1023;
+
+  if (err >= 0) {
+    sign = 0;
+  } else {
+    sign = 1;
+  }
+
+  /* err clipping */
+  if (ABS(err) > MAX_ERR) {
+    err = MAX_ERR;
+  }
+
+  Serial.print("DEAD_ZONE_TH =");
+  Serial.println(DEAD_ZONE_TH);
+
+  if (ABS(err) > DEAD_ZONE_TH) {
+    /* calcurate the velocity */
+    if (sign == 0) {
+        vel_set_r = vel_set_r - (vel_set_r * ABS(err) / MAX_ERR);
+    } else {
+        vel_set_l = vel_set_l - (vel_set_l * ABS(err) / MAX_ERR);
+    }
+  }
+
+  /* set motor parameter */
+  analogWrite(MT_PWM_R, vel_set_r);
+  analogWrite(MT_PWM_L, vel_set_l);
+
+#ifdef DEBUG
+  Serial.print("err = ");
+  Serial.println(err);
+
+  Serial.print("vel_set_l = ");
+  Serial.println(vel_set_l);
+
+  Serial.print("vel_set_r = ");
+  Serial.println(vel_set_r);
+#endif
+
+#if 0
   //センサ値に応じた走行パターンを決定----------------------------------
   //左外側のセンサがラインを認識していないとき(白と認識しているとき)
   if(line_sensor_l2 > THREAD_LINE)
@@ -273,15 +316,9 @@ void loop() {
       analogWrite(MT_PWM_L,vel_set_l);
     }
   }
-
-  GET_CYCLE(i_time);
-
 #endif
-  //----------------------------------------------------------------------
-
-
+  //interrupts();
   //↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集OK↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
-
 
   //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集NG↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
   boot_time = millis();
@@ -299,22 +336,23 @@ void loop() {
   }
   //↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集NG↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
-#if 0
   GET_CYCLE(i_time);
-
-  for (int i = 0; i < i_time; i++) {
-    if (i > 0) {
-      elapse_time = time_history[i] - time_history[i-1];
-      Serial.print("elapse_time[");
-      Serial.print(i);
-      Serial.print("]=");
-      Serial.print(elapse_time);
-      Serial.println("[us]");
-      delayMicroseconds(10000);
+  if (i_time == TIME_HISTORY_NUM) {
+#ifdef DEBUG 
+    for (int i = 0; i < i_time; i++) {
+      if (i > 0) {
+        elapse_time = time_history[i] - time_history[i-1];
+        Serial.print("elapse_time[");
+        Serial.print(i);
+        Serial.print("]=");
+        Serial.print(elapse_time);
+        Serial.println("[us]");
+        //delayMicroseconds(10000);
+      }
     }
-  }
-  i_time = 0;
+    i_time = 0;
 #endif
+  }
 }
 
 
