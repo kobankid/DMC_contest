@@ -52,7 +52,7 @@ void disp_lap_time(void);
 //↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
 
 ////////ソフトウェアパラメータ/////////
-// #define DEBUG
+//#define DEBUG
 
 #ifdef DEBUG
 #define GET_CYCLE(a)                \
@@ -254,8 +254,10 @@ void loop() {
     err = MAX_ERR;
   }
 
+#ifdef DEBUG
   Serial.print("DEAD_ZONE_TH =");
   Serial.println(DEAD_ZONE_TH);
+#endif
 
   if (ABS(err) > DEAD_ZONE_TH) {
     /* calcurate the velocity */
