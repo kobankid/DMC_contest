@@ -52,11 +52,12 @@ void disp_lap_time(void);
 //↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
 
 ////////ソフトウェアパラメータ/////////
-// #define DEBUG
+//#define DEBUG
 
 #ifdef DEBUG
-#define GET_CYCLE(a)                \
+#define GET_CYCLE(label, a)          \
     do {                            \
+        i_time_history[a] = label;  \
         time_history[a] = micros(); \
         if (a < TIME_HISTORY_NUM) { \
             a++;                    \
@@ -65,11 +66,13 @@ void disp_lap_time(void);
         }                           \
     } while(0)
 #else
-#define GET_CYCLE(a)
+#define GET_CYCLE(label, a)
 #endif
 
-#define ABS(a) (a>=0 ? a : -a)
-
+#define ABS(a)          (a >= 0 ? a : -a)
+#define SIGN(a)         (a >= 0 ? 1 : -1)
+#define MAX_CLIP(a, b)  (a >= b ? a = b : a)
+#define ZERO_CLIP(a) (a < 0  ? a = 0 : a)
 
 // 定数設定---------------------------------------------
 #define SW_OFF  HIGH
@@ -84,12 +87,17 @@ void disp_lap_time(void);
 
 /* Control parameter */
 #define CTRL_INTERVAL (100)
-#define INNER_COEF    (1)
-#define OUTER_COEF    (2)
+#define G1            (0.1)
+#define G2            (0.5)
 #define OFFSET        (0)
-#define MAX_ERR       (500 * (INNER_COEF + OUTER_COEF))
-#define DEAD_ZONE_TH  (100)
-#define COEF          (65536 / MAX_ERR)
+#define DEAD_ZONE_TH  (75)
+#define INNER_CTL_TH  (225)
+#define ERR1_MAX      (225)
+#define ERR2_MAX      (250)
+#define L1_SENS_OFS   (0)
+#define L2_SENS_OFS   (30)
+#define R1_SENS_OFS   (35)
+#define R2_SENS_OFS   (0)
 
 //---------------------------------------------------
 
@@ -109,7 +117,6 @@ long  vr_ad_r;
 
 long  vel_set_l;
 long  vel_set_r;
-long  g_coef;
 
 unsigned long start_time;
 unsigned long total_time;
@@ -117,6 +124,7 @@ unsigned long lap_time[LAP_NUM+1];
 unsigned long boot_time;
 byte n_lap = 0;
 
+unsigned long i_time_history[TIME_HISTORY_NUM];
 unsigned long time_history[TIME_HISTORY_NUM];
 unsigned long i_time = 0;
 unsigned long elapse_time;
@@ -156,9 +164,6 @@ void setup() {
   //↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集NG↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
   //↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
-
-
-  g_coef = COEF;
 
   //モータの回転方向を設定
   digitalWrite(MT_DIR_L,MT_FORWARD_L);//前進
@@ -216,10 +221,11 @@ void loop() {
   // put your main code here, to run repeatedly:
   //繰り返し走るプログラム
 
-  long err = 0;
-  int sign = 1;
+  long err_abs, err_max, err1, err2, err1_abs, err2_abs;
+  long err1_sign, err2_sign;
+  float gain;
+  long l_velocity, r_velocity;
 
-  g_coef = COEF;
   /* Serial.print("g_coef = "); */
   /* Serial.println(g_coef); */
 
@@ -228,98 +234,96 @@ void loop() {
   /*     /\* wait for interrupt *\/ */
   /* } */
   //noInterrupts();
-  GET_CYCLE(i_time);
-  interrupt_flag = 0;
-  //ラインセンサを読み込む
-  line_sensor_l1 = analogRead(LS_L1);
-  line_sensor_r1 = analogRead(LS_R1);
-  line_sensor_l2 = analogRead(LS_L2);
-  line_sensor_r2 = analogRead(LS_R2);
+  GET_CYCLE(1, i_time);
+  GET_CYCLE(2, i_time);
+  //interrupt_flag = 0;
 
-  err = (INNER_COEF * (line_sensor_l1 - line_sensor_r1))
-      + (OUTER_COEF * (line_sensor_l2 - line_sensor_r2))
-      + OFFSET;
+  /* Read sensor value */
+  line_sensor_l1 = analogRead(LS_L1) + L1_SENS_OFS;
+  line_sensor_r1 = analogRead(LS_R1) + R1_SENS_OFS;
+  line_sensor_l2 = analogRead(LS_L2) + L2_SENS_OFS;
+  line_sensor_r2 = analogRead(LS_R2) + R2_SENS_OFS;
 
-  vel_set_l = vr_ad_l * 255 / 1023;
-  vel_set_r = vr_ad_r * 255 / 1023;
+  /* Error signal calcuration */
+  err1 = line_sensor_l1 - line_sensor_r1;
+  err2 = line_sensor_l2 - line_sensor_r2;
 
-  if (err >= 0) {
-    sign = 0;
-  } else {
-    sign = 1;
-  }
+  /* Error clipping */
+  err1_abs = ABS(err1);
+  err2_abs = ABS(err2);
+  /* MAX_CLIP(err1_abs, ERR1_MAX); */
+  /* MAX_CLIP(err2_abs, ERR2_MAX); */
 
-  /* err clipping */
-  if (ABS(err) > MAX_ERR) {
-    err = MAX_ERR;
-  }
-
-  Serial.print("DEAD_ZONE_TH =");
-  Serial.println(DEAD_ZONE_TH);
-
-  if (ABS(err) > DEAD_ZONE_TH) {
-    /* calcurate the velocity */
-    if (sign == 0) {
-        vel_set_r = vel_set_r - (vel_set_r * ABS(err) / MAX_ERR);
+  /* within range ? */
+  if (err2_abs > DEAD_ZONE_TH) {
+    if (err1_abs <= INNER_CTL_TH) {
+      gain = G1;
+      err_abs = err1_abs;
+      err_max = ERR1_MAX;
     } else {
-        vel_set_l = vel_set_l - (vel_set_l * ABS(err) / MAX_ERR);
+      gain = G2;
+      err_abs = err2_abs;
+      err_max = ERR2_MAX;
     }
+    /* calcurate the velocity */
+    if (err1 < 0) {
+        l_velocity = vel_set_l * (float)(1 - gain * err_abs / (float)err_max);
+        r_velocity = vel_set_r;
+    } else {
+        l_velocity = vel_set_l;
+        r_velocity = vel_set_r * (float)(1 - gain * err_abs / (float)err_max);
+    }      
+  } else {
+    l_velocity = vel_set_l;
+    r_velocity = vel_set_r;
   }
+
+  ZERO_CLIP(l_velocity);
+  ZERO_CLIP(r_velocity);
 
   /* set motor parameter */
-  analogWrite(MT_PWM_R, vel_set_r);
-  analogWrite(MT_PWM_L, vel_set_l);
+  analogWrite(MT_PWM_L, l_velocity);
+  analogWrite(MT_PWM_R, r_velocity);
 
-#ifdef DEBUG
-  Serial.print("err = ");
-  Serial.println(err);
+  GET_CYCLE(3, i_time);
 
-  Serial.print("vel_set_l = ");
-  Serial.println(vel_set_l);
+#if 1
+  Serial.print("err_abs = ");
+  Serial.println(err_abs);
 
-  Serial.print("vel_set_r = ");
-  Serial.println(vel_set_r);
+  Serial.print("err1_abs = ");
+  Serial.println(err1_abs);
+
+  Serial.print("line_sensor_l1 = ");
+  Serial.println(line_sensor_l1);
+
+  Serial.print("line_sensor_r1 = ");
+  Serial.println(line_sensor_r1);
+
+  Serial.print("line_sensor_l2 = ");
+  Serial.println(line_sensor_l2);
+
+  Serial.print("line_sensor_r2 = ");
+  Serial.println(line_sensor_r2);
+
+  Serial.print("err1 = ");
+  Serial.println(err1);
+
+  Serial.print("err2 = ");
+  Serial.println(err2);
+
+  Serial.print("l_velocity = ");
+  Serial.println(l_velocity);
+
+  Serial.print("r_velocity = ");
+  Serial.println(r_velocity);
 #endif
 
-#if 0
-  //センサ値に応じた走行パターンを決定----------------------------------
-  //左外側のセンサがラインを認識していないとき(白と認識しているとき)
-  if(line_sensor_l2 > THREAD_LINE)
-  {
-     //かつ右外側のセンサがラインを認識していないとき(白と認識しているとき)
-    if(line_sensor_r2 > THREAD_LINE)
-    {
-      //直進
-      analogWrite(MT_PWM_R,vel_set_r);
-      analogWrite(MT_PWM_L,vel_set_l);
-    }
-    else//かつ右外側のセンサがラインを認識しているとき(黒と認識しているとき)
-    {
-      //右折
-      analogWrite(MT_PWM_R,0);
-      analogWrite(MT_PWM_L,vel_set_l);
-    }
-  }
-  else//左外側のセンサがラインを認識しているとき(黒と認識しているとき)
-  {
-    //かつ右外側のセンサがラインを認識していないとき（白と認識しているとき）
-    if(line_sensor_r2 > THREAD_LINE)
-    {
-      //左折
-      analogWrite(MT_PWM_R,vel_set_r);
-      analogWrite(MT_PWM_L,0);
-    }
-    else//かつ右外側のセンサがラインを認識しているとき(黒と認識しているとき)
-    {
-      //直進
-      analogWrite(MT_PWM_R,vel_set_r);
-      analogWrite(MT_PWM_L,vel_set_l);
-    }
-  }
-#endif
+
   //interrupts();
   //↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集OK↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
+#if 0
   //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集NG↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
   boot_time = millis();
   goal_lap_check();//編集禁止
@@ -335,10 +339,11 @@ void loop() {
     }
   }
   //↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集NG↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
+#endif
 
-  GET_CYCLE(i_time);
+  GET_CYCLE(4, i_time);
   if (i_time == TIME_HISTORY_NUM) {
-#ifdef DEBUG 
+#ifdef DEBUG
     for (int i = 0; i < i_time; i++) {
       if (i > 0) {
         elapse_time = time_history[i] - time_history[i-1];
@@ -346,7 +351,8 @@ void loop() {
         Serial.print(i);
         Serial.print("]=");
         Serial.print(elapse_time);
-        Serial.println("[us]");
+        Serial.print("[us]");
+        Serial.println(i_time_history[i]);
         //delayMicroseconds(10000);
       }
     }
