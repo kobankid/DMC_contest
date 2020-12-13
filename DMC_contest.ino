@@ -23,6 +23,7 @@ void parameter_display(void);
 void goal_lap_check(void);
 void time_check(void);
 void disp_lap_time(void);
+void control(void);
 
 // ピン設定
 //LED
@@ -52,7 +53,8 @@ void disp_lap_time(void);
 //↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
 
 ////////ソフトウェアパラメータ/////////
-//#define DEBUG
+// #define DEBUG
+#define INTERRUPT
 
 #ifdef DEBUG
 #define GET_CYCLE(label, a)          \
@@ -72,7 +74,7 @@ void disp_lap_time(void);
 #define ABS(a)          (a >= 0 ? a : -a)
 #define SIGN(a)         (a >= 0 ? 1 : -1)
 #define MAX_CLIP(a, b)  (a >= b ? a = b : a)
-#define ZERO_CLIP(a) (a < 0  ? a = 0 : a)
+#define ZERO_CLIP(a)    (a < 0  ? a = 0 : a)
 
 // 定数設定---------------------------------------------
 #define SW_OFF  HIGH
@@ -86,23 +88,28 @@ void disp_lap_time(void);
 #define TIME_HISTORY_NUM 10
 
 /* Control parameter */
-#define CTRL_INTERVAL (100)
-#define G1            (0.1)
-#define G2            (0.5)
-#define OFFSET        (0)
-#define DEAD_ZONE_TH  (75)
+#define CTRL_INTERVAL (1)
+#define PG            (0.65)
+#define DG            (2.00)
+#define G1            (2)
+#define G2            (3)
 #define INNER_CTL_TH  (225)
-#define ERR1_MAX      (225)
-#define ERR2_MAX      (250)
+#define ERR1_MAX      (300)
+#define ERR2_MAX      (300)
+#define ERR_MAX       ((G1 * ERR1_MAX) + (G2 * ERR2_MAX))
+#define D_ERR_MAX     ((G1 + G2) * 150)
+#define DEAD_ZONE_TH  (35 * (G1 + G2))
 #define L1_SENS_OFS   (0)
 #define L2_SENS_OFS   (30)
 #define R1_SENS_OFS   (35)
 #define R2_SENS_OFS   (0)
+#define D_ERR_MAX     (300)
+
 
 //---------------------------------------------------
 
 //パラメータ設定---------------------------------------
-#define THREAD_LINE 250 //IRセンサがラインを認識する閾値
+#define THREAD_LINE 300 //IRセンサがラインを認識する閾値
 #define LAP_NUM 2 //周回数(レースモード時)
 //---------------------------------------------------
 
@@ -129,6 +136,8 @@ unsigned long time_history[TIME_HISTORY_NUM];
 unsigned long i_time = 0;
 unsigned long elapse_time;
 volatile unsigned int interrupt_flag = 0;
+long p_err_old = 0;
+unsigned long flag = 0;
 
 
 
@@ -175,7 +184,7 @@ void setup() {
   display.setTextColor(SSD1306_WHITE);
   display.print(F("DMC TRACER"));
   display.display();
-  delay(2000);
+  // delay(2000);
   //--------------------------------
 
   i_time = 0;
@@ -185,6 +194,7 @@ void setup() {
   {
     if(digitalRead(SW_R)==SW_ON)
     {
+      delay(2000);
       break;
     }
     //ラインセンサ値読み込み
@@ -205,38 +215,41 @@ void setup() {
     parameter_display();
   }
 
-  /* MsTimer2::set(CTRL_INTERVAL, timer_interrupt); */
-  /* MsTimer2::start(); */
+  MsTimer2::set(CTRL_INTERVAL, timer_interrupt);
+  MsTimer2::start();
   //↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集OK↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 }
 
 void timer_interrupt(void) {
   interrupt_flag = 1;
+#ifdef INTERRUPT
+  control();
+#endif
   //Serial.println("interrupts");
 }
 
-//メインループ
-void loop() {
-
-  // put your main code here, to run repeatedly:
-  //繰り返し走るプログラム
-
-  long err_abs, err_max, err1, err2, err1_abs, err2_abs;
-  long err1_sign, err2_sign;
-  float gain;
+void control(void)
+{
+  long p_err_abs, p_err_max;
+  float p_err, d_err, err1, err2;
   long l_velocity, r_velocity;
 
-  /* Serial.print("g_coef = "); */
-  /* Serial.println(g_coef); */
-
   //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
-  /* while (interrupt_flag == 0) { */
-  /*     /\* wait for interrupt *\/ */
-  /* } */
-  //noInterrupts();
+
+  noInterrupts();
   GET_CYCLE(1, i_time);
   GET_CYCLE(2, i_time);
-  //interrupt_flag = 0;
+
+  if (n_lap > LAP_NUM) {
+      analogWrite(MT_PWM_R,0);
+      analogWrite(MT_PWM_L,0);
+      MsTimer2::stop();
+      return;
+  }
+
+#ifndef INTERRUPT
+  interrupt_flag = 0;
+#endif
 
   /* Read sensor value */
   line_sensor_l1 = analogRead(LS_L1) + L1_SENS_OFS;
@@ -245,34 +258,31 @@ void loop() {
   line_sensor_r2 = analogRead(LS_R2) + R2_SENS_OFS;
 
   /* Error signal calcuration */
-  err1 = line_sensor_l1 - line_sensor_r1;
-  err2 = line_sensor_l2 - line_sensor_r2;
+  err1        = (float)(G1 * (line_sensor_l1 - line_sensor_r1));
+  err2        = (float)(G2 * (line_sensor_l2 - line_sensor_r2));
+  p_err       = err1 + err2;
+  p_err_abs   = ABS(p_err);
+  //p_err_max   = (float)(G1 * ERR1_MAX + G2 * ERR2_MAX);
 
-  /* Error clipping */
-  err1_abs = ABS(err1);
-  err2_abs = ABS(err2);
-  /* MAX_CLIP(err1_abs, ERR1_MAX); */
-  /* MAX_CLIP(err2_abs, ERR2_MAX); */
+  if (flag == 1) {
+      d_err = p_err - p_err_old;
+  }
+
+  flag = 1;
+  p_err_old = p_err;
 
   /* within range ? */
-  if (err2_abs > DEAD_ZONE_TH) {
-    if (err1_abs <= INNER_CTL_TH) {
-      gain = G1;
-      err_abs = err1_abs;
-      err_max = ERR1_MAX;
-    } else {
-      gain = G2;
-      err_abs = err2_abs;
-      err_max = ERR2_MAX;
-    }
+  if (p_err_abs > DEAD_ZONE_TH) {
     /* calcurate the velocity */
-    if (err1 < 0) {
-        l_velocity = vel_set_l * (float)(1 - gain * err_abs / (float)err_max);
+    if (p_err < 0) {
+        l_velocity = vel_set_l
+            * (float)(1 - ((PG * p_err_abs / (float)ERR_MAX) + DG * (float)d_err / D_ERR_MAX));
         r_velocity = vel_set_r;
     } else {
         l_velocity = vel_set_l;
-        r_velocity = vel_set_r * (float)(1 - gain * err_abs / (float)err_max);
-    }      
+        r_velocity = vel_set_r
+            * (float)(1 - ((PG * p_err_abs / (float)ERR_MAX) + DG * (float)d_err / D_ERR_MAX));
+    }
   } else {
     l_velocity = vel_set_l;
     r_velocity = vel_set_r;
@@ -287,12 +297,11 @@ void loop() {
 
   GET_CYCLE(3, i_time);
 
-#if 1
-  Serial.print("err_abs = ");
-  Serial.println(err_abs);
+  interrupts();
 
-  Serial.print("err1_abs = ");
-  Serial.println(err1_abs);
+#if 0
+  Serial.print("p_err_abs = ");
+  Serial.println(p_err_abs);
 
   Serial.print("line_sensor_l1 = ");
   Serial.println(line_sensor_l1);
@@ -320,10 +329,27 @@ void loop() {
 #endif
 
 
-  //interrupts();
+  return;
+}
+
+
+//メインループ
+void loop() {
+
+  // put your main code here, to run repeatedly:
+  //繰り返し走るプログラム
+
+  /* while (interrupt_flag == 0) { */
+    /* wait for interrupt */
+  /* } */
+
+#ifndef INTERRUPT
+  control();
+#endif
+
   //↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集OK↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
-#if 0
+#if 1
   //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集NG↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
   boot_time = millis();
   goal_lap_check();//編集禁止
@@ -342,8 +368,9 @@ void loop() {
 #endif
 
   GET_CYCLE(4, i_time);
-  if (i_time == TIME_HISTORY_NUM) {
 #ifdef DEBUG
+  noInterrupts();
+  if (i_time == TIME_HISTORY_NUM) {
     for (int i = 0; i < i_time; i++) {
       if (i > 0) {
         elapse_time = time_history[i] - time_history[i-1];
@@ -357,8 +384,10 @@ void loop() {
       }
     }
     i_time = 0;
-#endif
   }
+  interrupts();
+#endif
+
 }
 
 
