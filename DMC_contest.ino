@@ -93,21 +93,28 @@ void control(void);
 /* Control parameter */
 #define CTRL_INTERVAL_MS (1)
 #define CTRL_INTERVAL_US (500)
-#define PG               (0.65)
-#define DG               (2.00)
+#define DELTA_T          (CTRL_INTERVAL_US / 1000000.0)
+
+#define S1_ERR_MAX       (300)
+#define S2_ERR_MAX       (300)
+#define CHANGE_MAX       (150)
+#define INTEG_MAX        (200)
+#define P_ERR_MAX        ((G1 * S1_ERR_MAX) + (G2 * S2_ERR_MAX))
+#define I_ERR_MAX        ((G1 + G2) * INTEG_MAX)
+#define D_ERR_MAX        ((G1 + G2) * CHANGE_MAX)
+
+#define PG               (0.65 / P_ERR_MAX)
+#define IG               (0.00 / I_ERR_MAX)
+#define DG               (0.01 / D_ERR_MAX)
 #define G1               (2)
 #define G2               (3)
-#define INNER_CTL_TH     (225)
-#define ERR1_MAX         (300)
-#define ERR2_MAX         (300)
-#define ERR_MAX          ((G1 * ERR1_MAX) + (G2 * ERR2_MAX))
-#define D_ERR_MAX        ((G1 + G2) * 150)
+
 #define DEAD_ZONE_TH     (30 * (G1 + G2))
+
 #define L1_SENS_OFS      (0)
 #define L2_SENS_OFS      (30)
 #define R1_SENS_OFS      (35)
 #define R2_SENS_OFS      (0)
-#define D_ERR_MAX        (300)
 
 
 //---------------------------------------------------
@@ -141,10 +148,8 @@ unsigned long i_time_history[TIME_HISTORY_NUM];
 unsigned long time_history[TIME_HISTORY_NUM];
 unsigned long i_time = 0;
 unsigned long elapse_time;
-volatile unsigned int interrupt_flag = 0;
-float p_err_old = 0;
-unsigned long d_flag = 0;
-
+float diff[2]  = {0, 0};
+float integral = 0;
 
 //-----------------------------
 
@@ -231,19 +236,17 @@ void setup() {
 }
 
 void timer_interrupt(void) {
-  // interrupt_flag = 1;
-#ifdef INTERRUPT
   GET_CYCLE(1, i_time);
   control();
   GET_CYCLE(2, i_time);
-#endif
   //Serial.println("interrupts");
 }
 
 void control(void)
 {
-  long p_err_abs, p_err_max;
-  float p_err, d_err, err1, err2;
+  float p, i, d, sum;
+  float s1_err, s2_err, change, diff_abs;
+  long p_err_max;
   long l_velocity, r_velocity;
 
   //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
@@ -265,29 +268,29 @@ void control(void)
   line_sensor_r2 = analogRead(LS_R2) + R2_SENS_OFS;
 
   /* Error signal calcuration */
-  err1        = (float)(G1 * (line_sensor_l1 - line_sensor_r1));
-  err2        = (float)(G2 * (line_sensor_l2 - line_sensor_r2));
-  p_err       = err1 + err2;
-  p_err_abs   = ABS(p_err);
+  s1_err      = (float)(G1 * (line_sensor_l1 - line_sensor_r1));
+  s2_err      = (float)(G2 * (line_sensor_l2 - line_sensor_r2));
+  diff[0]     = diff[1];
+  diff[1]     = s1_err + s2_err;
+  integral    += (diff[1] + diff[0]) / 2.0 * DELTA_T;
+  change      = (diff[1] - diff[0]) / DELTA_T;
+  diff_abs    = ABS(diff[1]);
 
-  if (d_flag == 1) {
-      d_err = p_err - p_err_old;
-  }
+  p = PG * diff[1];
+  i = IG * integral;
+  d = DG * change;
 
-  d_flag = 1;
-  p_err_old = p_err;
+  sum = p + i + d;
 
   /* within range ? */
-  if (p_err_abs > DEAD_ZONE_TH) {
+  if (diff_abs > DEAD_ZONE_TH) {
     /* calcurate the velocity */
-    if (p_err < 0) {
-        l_velocity = vel_set_l
-            * (float)(1 - ((PG * p_err_abs / (float)ERR_MAX) + DG * (float)d_err / D_ERR_MAX));
+    if (sum < 0) {
+        l_velocity = vel_set_l * (float)(1 + sum);
         r_velocity = vel_set_r;
     } else {
         l_velocity = vel_set_l;
-        r_velocity = vel_set_r
-            * (float)(1 - ((PG * p_err_abs / (float)ERR_MAX) + DG * (float)d_err / D_ERR_MAX));
+        r_velocity = vel_set_r * (float)(1 - sum);
     }
   } else {
     l_velocity = vel_set_l;
@@ -302,12 +305,9 @@ void control(void)
   analogWrite(MT_PWM_L, l_velocity);
   analogWrite(MT_PWM_R, r_velocity);
 
-  /* interrupt enable */
-  interrupts();
-
 #if 0
-  Serial.print("p_err_abs = ");
-  Serial.println(p_err_abs);
+  Serial.print("diff[1] = ");
+  Serial.println(diff[1]);
 
   Serial.print("line_sensor_l1 = ");
   Serial.println(line_sensor_l1);
@@ -321,18 +321,33 @@ void control(void)
   Serial.print("line_sensor_r2 = ");
   Serial.println(line_sensor_r2);
 
-  Serial.print("err1 = ");
-  Serial.println(err1);
+  Serial.print("s1_err = ");
+  Serial.println(s1_err);
 
-  Serial.print("err2 = ");
-  Serial.println(err2);
+  Serial.print("s2_err = ");
+  Serial.println(s2_err);
 
   Serial.print("l_velocity = ");
   Serial.println(l_velocity);
 
   Serial.print("r_velocity = ");
   Serial.println(r_velocity);
+
+  Serial.print("p = ");
+  Serial.println(p);
+
+  Serial.print("i =");
+  Serial.println(i);
+
+  Serial.print("d =");
+  Serial.println(d);
+
+  Serial.print("sum = ");
+  Serial.println(sum);
 #endif
+
+  /* interrupt enable */
+  interrupts();
 
   return;
 }
