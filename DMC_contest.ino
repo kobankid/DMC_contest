@@ -1,6 +1,8 @@
 /////////////////////
 // DMC_tracer(M.Hirai)
 // sample soft
+// Remodeling by kobankid
+// Rev.1.0
 ////////////////////
 
 
@@ -10,7 +12,9 @@
 //OLED 関係
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
-#include <MsTimer2.h>
+//#include <MsTimer2.h>
+#include <TimerOne.h>
+
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 32 // OLED display height, in pixels
 // Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
@@ -53,8 +57,7 @@ void control(void);
 //↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
 
 ////////ソフトウェアパラメータ/////////
-// #define DEBUG
-#define INTERRUPT
+//#define DEBUG
 
 #ifdef DEBUG
 #define GET_CYCLE(label, a)          \
@@ -88,22 +91,23 @@ void control(void);
 #define TIME_HISTORY_NUM 10
 
 /* Control parameter */
-#define CTRL_INTERVAL (1)
-#define PG            (0.65)
-#define DG            (2.00)
-#define G1            (2)
-#define G2            (3)
-#define INNER_CTL_TH  (225)
-#define ERR1_MAX      (300)
-#define ERR2_MAX      (300)
-#define ERR_MAX       ((G1 * ERR1_MAX) + (G2 * ERR2_MAX))
-#define D_ERR_MAX     ((G1 + G2) * 150)
-#define DEAD_ZONE_TH  (35 * (G1 + G2))
-#define L1_SENS_OFS   (0)
-#define L2_SENS_OFS   (30)
-#define R1_SENS_OFS   (35)
-#define R2_SENS_OFS   (0)
-#define D_ERR_MAX     (300)
+#define CTRL_INTERVAL_MS (1)
+#define CTRL_INTERVAL_US (500)
+#define PG               (0.65)
+#define DG               (2.00)
+#define G1               (2)
+#define G2               (3)
+#define INNER_CTL_TH     (225)
+#define ERR1_MAX         (300)
+#define ERR2_MAX         (300)
+#define ERR_MAX          ((G1 * ERR1_MAX) + (G2 * ERR2_MAX))
+#define D_ERR_MAX        ((G1 + G2) * 150)
+#define DEAD_ZONE_TH     (30 * (G1 + G2))
+#define L1_SENS_OFS      (0)
+#define L2_SENS_OFS      (30)
+#define R1_SENS_OFS      (35)
+#define R2_SENS_OFS      (0)
+#define D_ERR_MAX        (300)
 
 
 //---------------------------------------------------
@@ -131,14 +135,15 @@ unsigned long lap_time[LAP_NUM+1];
 unsigned long boot_time;
 byte n_lap = 0;
 
+
+/* kobankid added variables */
 unsigned long i_time_history[TIME_HISTORY_NUM];
 unsigned long time_history[TIME_HISTORY_NUM];
 unsigned long i_time = 0;
 unsigned long elapse_time;
 volatile unsigned int interrupt_flag = 0;
-long p_err_old = 0;
-unsigned long flag = 0;
-
+float p_err_old = 0;
+unsigned long d_flag = 0;
 
 
 //-----------------------------
@@ -173,6 +178,10 @@ void setup() {
   //↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集NG↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
   //↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
+
+  /* AD変換の時間を短くする */
+  ADCSRA = ADCSRA & 0xf8;
+  ADCSRA = ADCSRA | 0x04;
 
   //モータの回転方向を設定
   digitalWrite(MT_DIR_L,MT_FORWARD_L);//前進
@@ -215,15 +224,18 @@ void setup() {
     parameter_display();
   }
 
-  MsTimer2::set(CTRL_INTERVAL, timer_interrupt);
-  MsTimer2::start();
+  Timer1.initialize(CTRL_INTERVAL_US);
+  Timer1.attachInterrupt(timer_interrupt);
+
   //↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集OK↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 }
 
 void timer_interrupt(void) {
-  interrupt_flag = 1;
+  // interrupt_flag = 1;
 #ifdef INTERRUPT
+  GET_CYCLE(1, i_time);
   control();
+  GET_CYCLE(2, i_time);
 #endif
   //Serial.println("interrupts");
 }
@@ -236,20 +248,15 @@ void control(void)
 
   //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
 
+  /* Interrupt disable */
   noInterrupts();
-  GET_CYCLE(1, i_time);
-  GET_CYCLE(2, i_time);
 
   if (n_lap > LAP_NUM) {
       analogWrite(MT_PWM_R,0);
       analogWrite(MT_PWM_L,0);
-      MsTimer2::stop();
+      Timer1.stop();
       return;
   }
-
-#ifndef INTERRUPT
-  interrupt_flag = 0;
-#endif
 
   /* Read sensor value */
   line_sensor_l1 = analogRead(LS_L1) + L1_SENS_OFS;
@@ -262,13 +269,12 @@ void control(void)
   err2        = (float)(G2 * (line_sensor_l2 - line_sensor_r2));
   p_err       = err1 + err2;
   p_err_abs   = ABS(p_err);
-  //p_err_max   = (float)(G1 * ERR1_MAX + G2 * ERR2_MAX);
 
-  if (flag == 1) {
+  if (d_flag == 1) {
       d_err = p_err - p_err_old;
   }
 
-  flag = 1;
+  d_flag = 1;
   p_err_old = p_err;
 
   /* within range ? */
@@ -288,6 +294,7 @@ void control(void)
     r_velocity = vel_set_r;
   }
 
+  /* zero clip */
   ZERO_CLIP(l_velocity);
   ZERO_CLIP(r_velocity);
 
@@ -295,8 +302,7 @@ void control(void)
   analogWrite(MT_PWM_L, l_velocity);
   analogWrite(MT_PWM_R, r_velocity);
 
-  GET_CYCLE(3, i_time);
-
+  /* interrupt enable */
   interrupts();
 
 #if 0
@@ -328,7 +334,6 @@ void control(void)
   Serial.println(r_velocity);
 #endif
 
-
   return;
 }
 
@@ -339,17 +344,8 @@ void loop() {
   // put your main code here, to run repeatedly:
   //繰り返し走るプログラム
 
-  /* while (interrupt_flag == 0) { */
-    /* wait for interrupt */
-  /* } */
-
-#ifndef INTERRUPT
-  control();
-#endif
-
   //↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集OK↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
-#if 1
   //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集NG↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
   boot_time = millis();
   goal_lap_check();//編集禁止
@@ -365,9 +361,7 @@ void loop() {
     }
   }
   //↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集NG↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
-#endif
 
-  GET_CYCLE(4, i_time);
 #ifdef DEBUG
   noInterrupts();
   if (i_time == TIME_HISTORY_NUM) {
@@ -380,7 +374,6 @@ void loop() {
         Serial.print(elapse_time);
         Serial.print("[us]");
         Serial.println(i_time_history[i]);
-        //delayMicroseconds(10000);
       }
     }
     i_time = 0;
@@ -389,7 +382,6 @@ void loop() {
 #endif
 
 }
-
 
 //OLEDに各パラメータ値出力(デバッグ用)
 void parameter_display(void){
