@@ -1,6 +1,8 @@
 /////////////////////
 // DMC_tracer(M.Hirai)
 // sample soft
+// Remodeling by kobankid
+// Rev.1.0
 ////////////////////
 
 
@@ -10,7 +12,9 @@
 //OLED 関係
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
-#include <MsTimer2.h>
+//#include <MsTimer2.h>
+#include <TimerOne.h>
+
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 32 // OLED display height, in pixels
 // Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
@@ -23,6 +27,7 @@ void parameter_display(void);
 void goal_lap_check(void);
 void time_check(void);
 void disp_lap_time(void);
+void control(void);
 
 // ピン設定
 //LED
@@ -55,8 +60,9 @@ void disp_lap_time(void);
 //#define DEBUG
 
 #ifdef DEBUG
-#define GET_CYCLE(a)                \
+#define GET_CYCLE(label, a)          \
     do {                            \
+        i_time_history[a] = label;  \
         time_history[a] = micros(); \
         if (a < TIME_HISTORY_NUM) { \
             a++;                    \
@@ -65,11 +71,13 @@ void disp_lap_time(void);
         }                           \
     } while(0)
 #else
-#define GET_CYCLE(a)
+#define GET_CYCLE(label, a)
 #endif
 
-#define ABS(a) (a>=0 ? a : -a)
-
+#define ABS(a)          (a >= 0 ? a : -a)
+#define SIGN(a)         (a >= 0 ? 1 : -1)
+#define MAX_CLIP(a, b)  (a >= b ? a = b : a)
+#define ZERO_CLIP(a)    (a < 0  ? a = 0 : a)
 
 // 定数設定---------------------------------------------
 #define SW_OFF  HIGH
@@ -83,18 +91,36 @@ void disp_lap_time(void);
 #define TIME_HISTORY_NUM 10
 
 /* Control parameter */
-#define CTRL_INTERVAL (100)
-#define INNER_COEF    (1)
-#define OUTER_COEF    (2)
-#define OFFSET        (0)
-#define MAX_ERR       (500 * (INNER_COEF + OUTER_COEF))
-#define DEAD_ZONE_TH  (100)
-#define COEF          (65536 / MAX_ERR)
+#define CTRL_INTERVAL_MS (1)
+#define CTRL_INTERVAL_US (500)
+#define DELTA_T          (CTRL_INTERVAL_US / 1000000.0)
+
+#define S1_ERR_MAX       (300)
+#define S2_ERR_MAX       (300)
+#define CHANGE_MAX       (150)
+#define INTEG_MAX        (200)
+#define P_ERR_MAX        ((G1 * S1_ERR_MAX) + (G2 * S2_ERR_MAX))
+#define I_ERR_MAX        ((G1 + G2) * INTEG_MAX)
+#define D_ERR_MAX        ((G1 + G2) * CHANGE_MAX)
+
+#define PG               (0.65 / P_ERR_MAX)
+#define IG               (0.00 / I_ERR_MAX)
+#define DG               (0.01 / D_ERR_MAX)
+#define G1               (2)
+#define G2               (3)
+
+#define DEAD_ZONE_TH     (30 * (G1 + G2))
+
+#define L1_SENS_OFS      (0)
+#define L2_SENS_OFS      (30)
+#define R1_SENS_OFS      (35)
+#define R2_SENS_OFS      (0)
+
 
 //---------------------------------------------------
 
 //パラメータ設定---------------------------------------
-#define THREAD_LINE 250 //IRセンサがラインを認識する閾値
+#define THREAD_LINE 300 //IRセンサがラインを認識する閾値
 #define LAP_NUM 2 //周回数(レースモード時)
 //---------------------------------------------------
 
@@ -109,7 +135,6 @@ long  vr_ad_r;
 
 long  vel_set_l;
 long  vel_set_r;
-long  g_coef;
 
 unsigned long start_time;
 unsigned long total_time;
@@ -117,12 +142,14 @@ unsigned long lap_time[LAP_NUM+1];
 unsigned long boot_time;
 byte n_lap = 0;
 
+
+/* kobankid added variables */
+unsigned long i_time_history[TIME_HISTORY_NUM];
 unsigned long time_history[TIME_HISTORY_NUM];
 unsigned long i_time = 0;
 unsigned long elapse_time;
-volatile unsigned int interrupt_flag = 0;
-
-
+float diff[2]  = {0, 0};
+float integral = 0;
 
 //-----------------------------
 
@@ -157,8 +184,9 @@ void setup() {
 
   //↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
 
-
-  g_coef = COEF;
+  /* AD変換の時間を短くする */
+  ADCSRA = ADCSRA & 0xf8;
+  ADCSRA = ADCSRA | 0x04;
 
   //モータの回転方向を設定
   digitalWrite(MT_DIR_L,MT_FORWARD_L);//前進
@@ -170,7 +198,7 @@ void setup() {
   display.setTextColor(SSD1306_WHITE);
   display.print(F("DMC TRACER"));
   display.display();
-  delay(2000);
+  // delay(2000);
   //--------------------------------
 
   i_time = 0;
@@ -180,6 +208,7 @@ void setup() {
   {
     if(digitalRead(SW_R)==SW_ON)
     {
+      delay(2000);
       break;
     }
     //ラインセンサ値読み込み
@@ -200,15 +229,129 @@ void setup() {
     parameter_display();
   }
 
-  /* MsTimer2::set(CTRL_INTERVAL, timer_interrupt); */
-  /* MsTimer2::start(); */
+  Timer1.initialize(CTRL_INTERVAL_US);
+  Timer1.attachInterrupt(timer_interrupt);
+
   //↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集OK↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 }
 
 void timer_interrupt(void) {
-  interrupt_flag = 1;
+  GET_CYCLE(1, i_time);
+  control();
+  GET_CYCLE(2, i_time);
   //Serial.println("interrupts");
 }
+
+void control(void)
+{
+  float p, i, d, sum;
+  float s1_err, s2_err, change, diff_abs;
+  long p_err_max;
+  long l_velocity, r_velocity;
+
+  //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
+
+  /* Interrupt disable */
+  noInterrupts();
+
+  if (n_lap > LAP_NUM) {
+      analogWrite(MT_PWM_R,0);
+      analogWrite(MT_PWM_L,0);
+      Timer1.stop();
+      return;
+  }
+
+  /* Read sensor value */
+  line_sensor_l1 = analogRead(LS_L1) + L1_SENS_OFS;
+  line_sensor_r1 = analogRead(LS_R1) + R1_SENS_OFS;
+  line_sensor_l2 = analogRead(LS_L2) + L2_SENS_OFS;
+  line_sensor_r2 = analogRead(LS_R2) + R2_SENS_OFS;
+
+  /* Error signal calcuration */
+  s1_err      = (float)(G1 * (line_sensor_l1 - line_sensor_r1));
+  s2_err      = (float)(G2 * (line_sensor_l2 - line_sensor_r2));
+  diff[0]     = diff[1];
+  diff[1]     = s1_err + s2_err;
+  integral    += (diff[1] + diff[0]) / 2.0 * DELTA_T;
+  change      = (diff[1] - diff[0]) / DELTA_T;
+  diff_abs    = ABS(diff[1]);
+
+  p = PG * diff[1];
+  i = IG * integral;
+  d = DG * change;
+
+  sum = p + i + d;
+
+  /* within range ? */
+  if (diff_abs > DEAD_ZONE_TH) {
+    /* calcurate the velocity */
+    if (sum < 0) {
+        l_velocity = vel_set_l * (float)(1 + sum);
+        r_velocity = vel_set_r;
+    } else {
+        l_velocity = vel_set_l;
+        r_velocity = vel_set_r * (float)(1 - sum);
+    }
+  } else {
+    l_velocity = vel_set_l;
+    r_velocity = vel_set_r;
+  }
+
+  /* zero clip */
+  ZERO_CLIP(l_velocity);
+  ZERO_CLIP(r_velocity);
+
+  /* set motor parameter */
+  analogWrite(MT_PWM_L, l_velocity);
+  analogWrite(MT_PWM_R, r_velocity);
+
+#if 0
+  Serial.print("diff[1] = ");
+  Serial.println(diff[1]);
+
+  Serial.print("line_sensor_l1 = ");
+  Serial.println(line_sensor_l1);
+
+  Serial.print("line_sensor_r1 = ");
+  Serial.println(line_sensor_r1);
+
+  Serial.print("line_sensor_l2 = ");
+  Serial.println(line_sensor_l2);
+
+  Serial.print("line_sensor_r2 = ");
+  Serial.println(line_sensor_r2);
+
+  Serial.print("s1_err = ");
+  Serial.println(s1_err);
+
+  Serial.print("s2_err = ");
+  Serial.println(s2_err);
+
+  Serial.print("l_velocity = ");
+  Serial.println(l_velocity);
+
+  Serial.print("r_velocity = ");
+  Serial.println(r_velocity);
+
+  Serial.print("p = ");
+  Serial.println(p);
+
+  Serial.print("i =");
+  Serial.println(i);
+
+  Serial.print("d =");
+  Serial.println(d);
+
+  Serial.print("sum = ");
+  Serial.println(sum);
+#endif
+
+  /* interrupt enable */
+  interrupts();
+
+  return;
+}
+
 
 //メインループ
 void loop() {
@@ -216,110 +359,6 @@ void loop() {
   // put your main code here, to run repeatedly:
   //繰り返し走るプログラム
 
-  long err = 0;
-  int sign = 1;
-
-  g_coef = COEF;
-  /* Serial.print("g_coef = "); */
-  /* Serial.println(g_coef); */
-
-  //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
-  /* while (interrupt_flag == 0) { */
-  /*     /\* wait for interrupt *\/ */
-  /* } */
-  //noInterrupts();
-  GET_CYCLE(i_time);
-  interrupt_flag = 0;
-  //ラインセンサを読み込む
-  line_sensor_l1 = analogRead(LS_L1);
-  line_sensor_r1 = analogRead(LS_R1);
-  line_sensor_l2 = analogRead(LS_L2);
-  line_sensor_r2 = analogRead(LS_R2);
-
-  err = (INNER_COEF * (line_sensor_l1 - line_sensor_r1))
-      + (OUTER_COEF * (line_sensor_l2 - line_sensor_r2))
-      + OFFSET;
-
-  vel_set_l = vr_ad_l * 255 / 1023;
-  vel_set_r = vr_ad_r * 255 / 1023;
-
-  if (err >= 0) {
-    sign = 0;
-  } else {
-    sign = 1;
-  }
-
-  /* err clipping */
-  if (ABS(err) > MAX_ERR) {
-    err = MAX_ERR;
-  }
-
-#ifdef DEBUG
-  Serial.print("DEAD_ZONE_TH =");
-  Serial.println(DEAD_ZONE_TH);
-#endif
-
-  if (ABS(err) > DEAD_ZONE_TH) {
-    /* calcurate the velocity */
-    if (sign == 0) {
-        vel_set_r = vel_set_r - (vel_set_r * ABS(err) / MAX_ERR);
-    } else {
-        vel_set_l = vel_set_l - (vel_set_l * ABS(err) / MAX_ERR);
-    }
-  }
-
-  /* set motor parameter */
-  analogWrite(MT_PWM_R, vel_set_r);
-  analogWrite(MT_PWM_L, vel_set_l);
-
-#ifdef DEBUG
-  Serial.print("err = ");
-  Serial.println(err);
-
-  Serial.print("vel_set_l = ");
-  Serial.println(vel_set_l);
-
-  Serial.print("vel_set_r = ");
-  Serial.println(vel_set_r);
-#endif
-
-#if 0
-  //センサ値に応じた走行パターンを決定----------------------------------
-  //左外側のセンサがラインを認識していないとき(白と認識しているとき)
-  if(line_sensor_l2 > THREAD_LINE)
-  {
-     //かつ右外側のセンサがラインを認識していないとき(白と認識しているとき)
-    if(line_sensor_r2 > THREAD_LINE)
-    {
-      //直進
-      analogWrite(MT_PWM_R,vel_set_r);
-      analogWrite(MT_PWM_L,vel_set_l);
-    }
-    else//かつ右外側のセンサがラインを認識しているとき(黒と認識しているとき)
-    {
-      //右折
-      analogWrite(MT_PWM_R,0);
-      analogWrite(MT_PWM_L,vel_set_l);
-    }
-  }
-  else//左外側のセンサがラインを認識しているとき(黒と認識しているとき)
-  {
-    //かつ右外側のセンサがラインを認識していないとき（白と認識しているとき）
-    if(line_sensor_r2 > THREAD_LINE)
-    {
-      //左折
-      analogWrite(MT_PWM_R,vel_set_r);
-      analogWrite(MT_PWM_L,0);
-    }
-    else//かつ右外側のセンサがラインを認識しているとき(黒と認識しているとき)
-    {
-      //直進
-      analogWrite(MT_PWM_R,vel_set_r);
-      analogWrite(MT_PWM_L,vel_set_l);
-    }
-  }
-#endif
-  //interrupts();
   //↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集OK↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
   //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集NG↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
@@ -338,9 +377,9 @@ void loop() {
   }
   //↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑ここまで編集NG↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
-  GET_CYCLE(i_time);
+#ifdef DEBUG
+  noInterrupts();
   if (i_time == TIME_HISTORY_NUM) {
-#ifdef DEBUG 
     for (int i = 0; i < i_time; i++) {
       if (i > 0) {
         elapse_time = time_history[i] - time_history[i-1];
@@ -348,15 +387,16 @@ void loop() {
         Serial.print(i);
         Serial.print("]=");
         Serial.print(elapse_time);
-        Serial.println("[us]");
-        //delayMicroseconds(10000);
+        Serial.print("[us]");
+        Serial.println(i_time_history[i]);
       }
     }
     i_time = 0;
-#endif
   }
-}
+  interrupts();
+#endif
 
+}
 
 //OLEDに各パラメータ値出力(デバッグ用)
 void parameter_display(void){
