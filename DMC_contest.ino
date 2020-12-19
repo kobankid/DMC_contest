@@ -91,6 +91,7 @@ void control(void);
 #define TIME_HISTORY_NUM 10
 
 /* Control parameter */
+#define REVERSE_TH       (375)
 #define CTRL_INTERVAL_MS (1)
 #define CTRL_INTERVAL_US (500)
 #define DELTA_T          (CTRL_INTERVAL_US / 1000000.0)
@@ -103,11 +104,11 @@ void control(void);
 #define I_ERR_MAX        ((G1 + G2) * INTEG_MAX)
 #define D_ERR_MAX        ((G1 + G2) * CHANGE_MAX)
 
-#define PG               (0.65 / P_ERR_MAX)
+#define PG               (0.75 / P_ERR_MAX)
 #define IG               (0.00 / I_ERR_MAX)
 #define DG               (0.01 / D_ERR_MAX)
-#define G1               (2)
-#define G2               (3)
+#define G1               (0)
+#define G2               (5)
 
 #define DEAD_ZONE_TH     (30 * (G1 + G2))
 
@@ -225,6 +226,8 @@ void setup() {
     vel_set_l = vr_ad_l * 255 / 1023;
     vel_set_r = vr_ad_r * 255 / 1023;
 
+    //control();
+
     //OLEDに各パラメータ値出力(デバッグ用)
     parameter_display();
   }
@@ -242,19 +245,34 @@ void timer_interrupt(void) {
   //Serial.println("interrupts");
 }
 
+float s1_err, s2_err, change, diff_abs;
+long l_velocity, r_velocity, abs_l_velocity, abs_r_velocity;
+
 void control(void)
 {
   float p, i, d, sum;
-  float s1_err, s2_err, change, diff_abs;
   long p_err_max;
-  long l_velocity, r_velocity;
+  static long reverse_cnt = 0;
+  static long lap2_flag = 0;
 
   //↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓ここから編集OK↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
 
   /* Interrupt disable */
   noInterrupts();
 
-  if (n_lap > LAP_NUM) {
+  if (n_lap == 2) {
+      reverse_cnt++;
+      if (reverse_cnt <= REVERSE_TH) {
+        digitalWrite(MT_DIR_L,MT_REVERSE_L);
+        digitalWrite(MT_DIR_R,MT_FORWARD_R);
+        analogWrite(MT_PWM_R,255);
+        analogWrite(MT_PWM_L,255);
+        return 0;
+      } else {
+        digitalWrite(MT_DIR_L,MT_FORWARD_L);
+        digitalWrite(MT_DIR_R,MT_FORWARD_R);
+      }
+  } else if (n_lap > LAP_NUM) {
       analogWrite(MT_PWM_R,0);
       analogWrite(MT_PWM_L,0);
       Timer1.stop();
@@ -298,12 +316,29 @@ void control(void)
   }
 
   /* zero clip */
-  ZERO_CLIP(l_velocity);
-  ZERO_CLIP(r_velocity);
+  // ZERO_CLIP(l_velocity);
+  // ZERO_CLIP(r_velocity);
+
+  abs_l_velocity = ABS(l_velocity);
+  abs_r_velocity = ABS(r_velocity);
+
+  abs_l_velocity = MAX_CLIP(abs_l_velocity, vel_set_l);
+  abs_r_velocity = MAX_CLIP(abs_r_velocity, vel_set_l);
 
   /* set motor parameter */
-  analogWrite(MT_PWM_L, l_velocity);
-  analogWrite(MT_PWM_R, r_velocity);
+  if (l_velocity >= 0) {
+    digitalWrite(MT_DIR_L,MT_FORWARD_L);
+  } else {
+    digitalWrite(MT_DIR_L,MT_REVERSE_L);
+  }
+
+  if (r_velocity >= 0) {
+    digitalWrite(MT_DIR_R,MT_FORWARD_R);
+  } else {
+    digitalWrite(MT_DIR_R,MT_REVERSE_R);
+  }
+  analogWrite(MT_PWM_L, abs_l_velocity);
+  analogWrite(MT_PWM_R, abs_r_velocity);
 
 #if 0
   Serial.print("diff[1] = ");
@@ -415,10 +450,17 @@ void parameter_display(void){
     display.print(F(", L1:"));
     display.print(line_sensor_l1);
     display.print("\n");
-    display.print(F("R1:"));
-    display.print(line_sensor_r1);
-    display.print(F(", R2:"));
-    display.print(line_sensor_r2);
+    display.print(F("lv:"));
+    display.print(l_velocity);
+    display.print(F("rv"));
+    display.print(r_velocity);
+    display.print("\n");
+    display.print(F("l:"));
+    display.print(abs_l_velocity);
+    display.print(F(",r:"));
+    display.print(abs_r_velocity);
+    display.print(F(",e:"));
+    display.print(diff[1]);
     display.display();
     delay(5);
 }
